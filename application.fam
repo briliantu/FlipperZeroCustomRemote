@@ -7,6 +7,6 @@ App(
     stack_size=4 * 1024,
     fap_category="Infrared",
     fap_description="Map captured IR signals to an on-screen TV remote",
-    sources=["tv_remote.c"],
+    sources=["tv_remote.c", "tv_remote_view.c"],
     fap_libs=["infrared"],
 )

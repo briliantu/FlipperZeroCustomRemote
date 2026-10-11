@@ -32,10 +32,17 @@ uses the project-local Unleashed SDK rather than the stock firmware SDK.
 
 Mappings are saved in `/ext/apps_data/tv_remote` and restored per `.ir` filename.
 The app scans `.ir` files directly inside `/ext/infrared` (not nested folders)
-and displays up to 32 files and 64 signals per remote.
+case-insensitively, sorts them by name, and displays up to 32 files and 64
+signals per remote. Hold a direction to repeat through the file and signal lists.
 
 The remote uses a generic TV layout with Power, Mute, Volume +/-, Channel +/-,
 Up/Down/Left/Right, OK, Back, and a dedicated Netflix shortcut. Map Netflix to
 the Netflix command from your captured remote file; this sends the TV's IR
 shortcut and does not run Netflix on the Flipper itself. Buttons without a
 mapping are shown with a small marker.
+
+## Project files
+
+- `tv_remote.c` handles input, IR file access, transmission, and saved mappings.
+- `tv_remote_view.c` draws the remote and selection screens.
+- `tv_remote.h` contains shared app state and UI definitions.
