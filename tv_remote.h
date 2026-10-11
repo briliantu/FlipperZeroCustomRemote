@@ -5,20 +5,36 @@
 #include <gui/view_port.h>
 #include <storage/storage.h>
 
-#define INFRARED_DIRECTORY "/ext/infrared"
-#define MAPPING_DIRECTORY  "/ext/apps_data/tv_remote"
-#define MAX_REMOTE_FILES   32
-#define MAX_SIGNALS        64
-#define PATH_LENGTH        128
-#define NAME_LENGTH        32
-#define KEY_COUNT          13
-#define EVENT_QUEUE_LENGTH 8
+#define INFRARED_DIRECTORY  "/ext/infrared"
+#define MAPPING_DIRECTORY   "/ext/apps_data/tv_remote"
+#define THEME_SETTINGS_PATH MAPPING_DIRECTORY "/theme.cfg"
+#define MAX_REMOTE_FILES    32
+#define MAX_SIGNALS         64
+#define PATH_LENGTH         128
+#define NAME_LENGTH         32
+#define KEY_COUNT           13
+#define EVENT_QUEUE_LENGTH  8
 
 typedef enum {
+    ScreenHome,
     ScreenFiles,
     ScreenRemote,
     ScreenMap,
+    ScreenThemes,
 } RemoteScreen;
+
+typedef enum {
+    ThemeNaruto,
+    ThemeBleach,
+    ThemeDeathNote,
+    ThemeHxH,
+    ThemeCount,
+} RemoteTheme;
+
+typedef enum {
+    FileListNewRemote,
+    FileListSavedRemote,
+} FileListMode;
 
 typedef struct {
     char path[PATH_LENGTH];
@@ -39,6 +55,10 @@ typedef struct {
     bool storage_open;
     bool view_port_attached;
     RemoteScreen screen;
+    FileListMode file_list_mode;
+    RemoteTheme theme;
+    uint8_t home_selection;
+    uint8_t theme_selection;
     RemoteFile files[MAX_REMOTE_FILES];
     RemoteSignal signals[MAX_SIGNALS];
     int16_t mappings[KEY_COUNT];

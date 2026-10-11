@@ -9,16 +9,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 typedef enum {
     PendingActionNone,
+    PendingActionOpenList,
     PendingActionOpenRemote,
     PendingActionTransmit,
     PendingActionSaveMapping,
+    PendingActionSaveRemote,
+    PendingActionSaveTheme,
 } PendingActionType;
 
 typedef struct {
     PendingActionType type;
+    FileListMode file_list_mode;
     size_t file_index;
     size_t signal_index;
     uint8_t key_index;
@@ -58,16 +63,16 @@ static int compare_names_case_insensitive(const char* left, const char* right) {
 static void update_file_offset(TvRemoteApp* app) {
     if(app->file_selection < app->file_offset) {
         app->file_offset = app->file_selection;
-    } else if(app->file_selection >= app->file_offset + 5) {
-        app->file_offset = app->file_selection - 4;
+    } else if(app->file_selection >= app->file_offset + 4) {
+        app->file_offset = app->file_selection - 3;
     }
 }
 
 static void update_signal_offset(TvRemoteApp* app) {
     if(app->signal_selection < app->signal_offset) {
         app->signal_offset = app->signal_selection;
-    } else if(app->signal_selection >= app->signal_offset + 4) {
-        app->signal_offset = app->signal_selection - 3;
+    } else if(app->signal_selection >= app->signal_offset + 10) {
+        app->signal_offset = app->signal_selection - 9;
     }
 }
 
@@ -75,6 +80,19 @@ static void set_status(TvRemoteApp* app, const char* status) {
     if(app->state_mutex) furi_mutex_acquire(app->state_mutex, FuriWaitForever);
     copy_string(app->status, sizeof(app->status), status);
     if(app->state_mutex) furi_mutex_release(app->state_mutex);
+}
+
+static bool mapping_path_for_remote(const char* remote_path, char* mapping_path, size_t size) {
+    const char* base_name = strrchr(remote_path, '/');
+    base_name = base_name ? base_name + 1 : remote_path;
+    size_t base_length = strlen(base_name);
+    if(base_length < 4 || base_length - 3 >= NAME_LENGTH) return false;
+
+    char name[NAME_LENGTH];
+    memcpy(name, base_name, base_length - 3);
+    name[base_length - 3] = '\0';
+    int path_length = snprintf(mapping_path, size, "%s/%s.map", MAPPING_DIRECTORY, name);
+    return path_length >= 0 && (size_t)path_length < size;
 }
 
 static void scan_remote_files(TvRemoteApp* app) {
@@ -103,6 +121,13 @@ static void scan_remote_files(TvRemoteApp* app) {
             snprintf(candidate.path, sizeof(candidate.path), "%s/%s", INFRARED_DIRECTORY, name);
         if(path_length < 0 || (size_t)path_length >= sizeof(candidate.path)) continue;
         copy_string(candidate.name, sizeof(candidate.name), name);
+        if(app->file_list_mode == FileListSavedRemote) {
+            char mapping_path[PATH_LENGTH];
+            if(!mapping_path_for_remote(candidate.path, mapping_path, sizeof(mapping_path)) ||
+               !storage_common_exists(app->storage, mapping_path)) {
+                continue;
+            }
+        }
 
         size_t insert_at = 0;
         while(insert_at < app->file_count &&
@@ -120,22 +145,17 @@ static void scan_remote_files(TvRemoteApp* app) {
 
     storage_dir_close(directory);
     storage_file_free(directory);
-    set_status(app, app->file_count ? "" : "No .ir files in /ext/infrared");
+    if(app->file_count) {
+        set_status(app, "");
+    } else if(app->file_list_mode == FileListSavedRemote) {
+        set_status(app, "No saved remotes yet");
+    } else {
+        set_status(app, "No .ir captures in /ext/infrared");
+    }
 }
 
 static bool make_mapping_path(TvRemoteApp* app, const char* remote_path) {
-    const char* base_name = strrchr(remote_path, '/');
-    base_name = base_name ? base_name + 1 : remote_path;
-    size_t base_length = strlen(base_name);
-    if(base_length < 4 || base_length - 3 >= NAME_LENGTH) return false;
-
-    char name[NAME_LENGTH];
-    memcpy(name, base_name, base_length - 3);
-    name[base_length - 3] = '\0';
-
-    int path_length = snprintf(
-        app->mapping_path, sizeof(app->mapping_path), "%s/%s.map", MAPPING_DIRECTORY, name);
-    return path_length >= 0 && (size_t)path_length < sizeof(app->mapping_path);
+    return mapping_path_for_remote(remote_path, app->mapping_path, sizeof(app->mapping_path));
 }
 
 static bool load_mappings(TvRemoteApp* app) {
@@ -216,6 +236,70 @@ static bool save_mappings(TvRemoteApp* app) {
     success = success && close_success;
     storage_file_free(file);
     if(!success) set_status(app, "Could not save mapping");
+    return success;
+}
+
+static void load_theme(TvRemoteApp* app) {
+    File* file = storage_file_alloc(app->storage);
+    if(!file) {
+        FURI_LOG_E("TvRemote", "Failed to allocate theme settings reader");
+        return;
+    }
+    if(!storage_file_open(file, THEME_SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        return;
+    }
+
+    char contents[24];
+    size_t bytes_read = storage_file_read(file, contents, sizeof(contents) - 1);
+    bool close_success = storage_file_close(file);
+    storage_file_free(file);
+    if(!close_success) {
+        FURI_LOG_E("TvRemote", "Failed to close theme settings reader");
+        return;
+    }
+    contents[bytes_read] = '\0';
+
+    unsigned theme = 0;
+    if(sscanf(contents, "TVTHEME1\n%u", &theme) == 1 && theme < ThemeCount) {
+        app->theme = (RemoteTheme)theme;
+    } else {
+        FURI_LOG_E("TvRemote", "Invalid theme settings; using default");
+    }
+}
+
+static bool save_theme(TvRemoteApp* app) {
+    if(storage_common_mkdir(app->storage, "/ext/apps_data") != FSE_OK &&
+       !storage_common_exists(app->storage, "/ext/apps_data")) {
+        set_status(app, "Cannot create app data folder");
+        return false;
+    }
+    if(storage_common_mkdir(app->storage, MAPPING_DIRECTORY) != FSE_OK &&
+       !storage_common_exists(app->storage, MAPPING_DIRECTORY)) {
+        set_status(app, "Cannot create theme folder");
+        return false;
+    }
+
+    char contents[24];
+    int length = snprintf(contents, sizeof(contents), "TVTHEME1\n%u\n", (unsigned)app->theme);
+    if(length < 0 || (size_t)length >= sizeof(contents)) {
+        set_status(app, "Theme settings too large");
+        return false;
+    }
+
+    File* file = storage_file_alloc(app->storage);
+    if(!file) {
+        set_status(app, "Cannot allocate theme writer");
+        return false;
+    }
+    bool success = storage_file_open(file, THEME_SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    if(success) {
+        success = storage_file_write(file, contents, (size_t)length) == (size_t)length;
+    }
+    bool close_success = storage_file_close(file);
+    storage_file_free(file);
+    success = success && close_success;
+    if(!success) set_status(app, "Could not save theme");
     return success;
 }
 
@@ -354,6 +438,41 @@ static void transmit_signal(
     set_status(app, status);
 }
 
+static const uint8_t remote_key_x[KEY_COUNT] = {0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 2, 1};
+static const uint8_t remote_key_y[KEY_COUNT] = {0, 0, 1, 2, 4, 2, 1, 3, 5, 4, 6, 4, 7};
+
+static bool move_remote_selection(TvRemoteApp* app, InputKey direction) {
+    if(direction != InputKeyLeft && direction != InputKeyRight && direction != InputKeyUp &&
+       direction != InputKeyDown) {
+        return false;
+    }
+    bool horizontal = direction == InputKeyLeft || direction == InputKeyRight;
+    int sign = (direction == InputKeyLeft || direction == InputKeyUp) ? -1 : 1;
+    int current_x = remote_key_x[app->key_selection];
+    int current_y = remote_key_y[app->key_selection];
+    int best_score = INT_MAX;
+    size_t best_key = app->key_selection;
+
+    for(size_t key = 0; key < KEY_COUNT; key++) {
+        if(key == app->key_selection) continue;
+        int dx = (int)remote_key_x[key] - current_x;
+        int dy = (int)remote_key_y[key] - current_y;
+        int primary = horizontal ? dx : dy;
+        int secondary = horizontal ? dy : dx;
+        if(primary * sign <= 0) continue;
+
+        int score = abs(primary) * 10 + abs(secondary) * 3;
+        if(score < best_score) {
+            best_score = score;
+            best_key = key;
+        }
+    }
+
+    if(best_key == app->key_selection) return false;
+    app->key_selection = (uint8_t)best_key;
+    return true;
+}
+
 static bool handle_input(TvRemoteApp* app, const InputEvent* event, PendingAction* action) {
     memset(action, 0, sizeof(*action));
     bool short_press = event->type == InputTypeShort;
@@ -365,9 +484,45 @@ static bool handle_input(TvRemoteApp* app, const InputEvent* event, PendingActio
     if(!short_press && !long_press && !repeat) return false;
     if(furi_mutex_acquire(app->state_mutex, FuriWaitForever) != FuriStatusOk) return false;
 
-    if(app->screen == ScreenFiles) {
-        if(short_press && event->key == InputKeyBack) {
+    if(app->screen == ScreenHome) {
+        if(navigation && (event->key == InputKeyLeft || event->key == InputKeyRight)) {
+            app->home_selection = app->home_selection ? 0 : 1;
+            redraw = true;
+        } else if(long_press && event->key == InputKeyOk) {
+            app->theme_selection = app->theme;
+            app->screen = ScreenThemes;
+            set_status(app, "");
+            redraw = true;
+        } else if(short_press && event->key == InputKeyOk) {
+            action->type = PendingActionOpenList;
+            action->file_list_mode = app->home_selection == 0 ? FileListNewRemote :
+                                                                FileListSavedRemote;
+        } else if(short_press && event->key == InputKeyBack) {
             app->exit = true;
+            redraw = true;
+        }
+    } else if(app->screen == ScreenThemes) {
+        if(short_press && event->key == InputKeyBack) {
+            app->screen = ScreenHome;
+            set_status(app, "");
+            redraw = true;
+        } else if(
+            navigation && (event->key == InputKeyUp || event->key == InputKeyDown ||
+                           event->key == InputKeyLeft || event->key == InputKeyRight)) {
+            int direction = (event->key == InputKeyUp || event->key == InputKeyLeft) ? -1 : 1;
+            app->theme_selection =
+                (uint8_t)((app->theme_selection + ThemeCount + direction) % ThemeCount);
+            redraw = true;
+        } else if(short_press && event->key == InputKeyOk) {
+            app->theme = (RemoteTheme)app->theme_selection;
+            app->screen = ScreenHome;
+            action->type = PendingActionSaveTheme;
+            redraw = true;
+        }
+    } else if(app->screen == ScreenFiles) {
+        if(short_press && event->key == InputKeyBack) {
+            app->screen = ScreenHome;
+            set_status(app, "");
             redraw = true;
         } else if(navigation && event->key == InputKeyUp && app->file_selection > 0) {
             app->file_selection--;
@@ -384,7 +539,9 @@ static bool handle_input(TvRemoteApp* app, const InputEvent* event, PendingActio
             action->file_index = app->file_selection;
         }
     } else if(app->screen == ScreenRemote) {
-        if(short_press && event->key == InputKeyBack) {
+        if(long_press && event->key == InputKeyBack) {
+            action->type = PendingActionSaveRemote;
+        } else if(short_press && event->key == InputKeyBack) {
             app->screen = ScreenFiles;
             set_status(app, "");
             redraw = true;
@@ -409,42 +566,7 @@ static bool handle_input(TvRemoteApp* app, const InputEvent* event, PendingActio
                 set_status(app, "Hold OK to map this button");
                 redraw = true;
             }
-        } else if(
-            navigation && event->key == InputKeyLeft && app->key_selection < KEY_COUNT - 1 &&
-            app->key_selection % 3 > 0) {
-            app->key_selection--;
-            set_status(app, "");
-            redraw = true;
-        } else if(navigation && event->key == InputKeyLeft && app->key_selection == KEY_COUNT - 1) {
-            app->key_selection = 10;
-            set_status(app, "");
-            redraw = true;
-        } else if(
-            navigation && event->key == InputKeyRight && app->key_selection < KEY_COUNT - 1 &&
-            app->key_selection % 3 < 2) {
-            app->key_selection++;
-            set_status(app, "");
-            redraw = true;
-        } else if(navigation && event->key == InputKeyRight && app->key_selection == KEY_COUNT - 1) {
-            app->key_selection = 10;
-            set_status(app, "");
-            redraw = true;
-        } else if(navigation && event->key == InputKeyUp && app->key_selection == KEY_COUNT - 1) {
-            app->key_selection = 10;
-            set_status(app, "");
-            redraw = true;
-        } else if(navigation && event->key == InputKeyUp && app->key_selection >= 3) {
-            app->key_selection -= 3;
-            set_status(app, "");
-            redraw = true;
-        } else if(
-            navigation && event->key == InputKeyDown && app->key_selection >= 9 &&
-            app->key_selection <= 11) {
-            app->key_selection = KEY_COUNT - 1;
-            set_status(app, "");
-            redraw = true;
-        } else if(navigation && event->key == InputKeyDown && app->key_selection + 3 < 12) {
-            app->key_selection += 3;
+        } else if(navigation && move_remote_selection(app, event->key)) {
             set_status(app, "");
             redraw = true;
         }
@@ -476,12 +598,32 @@ static bool handle_input(TvRemoteApp* app, const InputEvent* event, PendingActio
 
 static bool perform_action(TvRemoteApp* app, const PendingAction* action) {
     if(action->type == PendingActionNone) return false;
+    if(action->type == PendingActionOpenList) {
+        app->file_list_mode = action->file_list_mode;
+        scan_remote_files(app);
+        furi_mutex_acquire(app->state_mutex, FuriWaitForever);
+        app->screen = ScreenFiles;
+        furi_mutex_release(app->state_mutex);
+        return true;
+    }
     if(action->type == PendingActionOpenRemote) {
         load_remote(app, action->file_index);
         return true;
     }
     if(action->type == PendingActionTransmit) {
         transmit_signal(app, action->remote_path, action->signal_index, action->key_index);
+        return true;
+    }
+    if(action->type == PendingActionSaveRemote) {
+        if(save_mappings(app)) {
+            set_status(app, "Remote saved");
+        }
+        return true;
+    }
+    if(action->type == PendingActionSaveTheme) {
+        if(save_theme(app)) {
+            set_status(app, "Theme saved");
+        }
         return true;
     }
     if(action->type == PendingActionSaveMapping) {
@@ -527,11 +669,13 @@ int32_t tv_remote_app(void* context) {
         return -1;
     }
     memset(app, 0, sizeof(TvRemoteApp));
-    app->screen = ScreenFiles;
+    app->screen = ScreenHome;
+    app->theme = ThemeNaruto;
     app->storage = furi_record_open(RECORD_STORAGE);
     app->storage_open = true;
     app->gui = furi_record_open(RECORD_GUI);
     app->gui_open = true;
+    load_theme(app);
     app->state_mutex = furi_mutex_alloc(FuriMutexTypeRecursive);
     app->event_queue = furi_message_queue_alloc(EVENT_QUEUE_LENGTH, sizeof(InputEvent));
     app->view_port = view_port_alloc();
@@ -541,7 +685,7 @@ int32_t tv_remote_app(void* context) {
         return -1;
     }
 
-    scan_remote_files(app);
+    view_port_set_orientation(app->view_port, ViewPortOrientationHorizontal);
     view_port_draw_callback_set(app->view_port, tv_remote_draw, app);
     view_port_input_callback_set(app->view_port, input_callback, app);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
@@ -553,6 +697,14 @@ int32_t tv_remote_app(void* context) {
             PendingAction action;
             bool redraw = handle_input(app, &event, &action);
             redraw = perform_action(app, &action) || redraw;
+            ViewPortOrientation orientation =
+                (app->screen == ScreenRemote || app->screen == ScreenMap) ?
+                    ViewPortOrientationVertical :
+                    ViewPortOrientationHorizontal;
+            if(view_port_get_orientation(app->view_port) != orientation) {
+                view_port_set_orientation(app->view_port, orientation);
+                redraw = true;
+            }
             if(redraw) view_port_update(app->view_port);
         }
     }
