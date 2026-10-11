@@ -1,0 +1,4 @@
+.venv/
+.ufbt/
+dist/
+.vscode/compile_commands.json

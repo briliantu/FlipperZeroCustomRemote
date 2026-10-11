@@ -1,0 +1,12 @@
+App(
+    appid="tv_remote",
+    name="TV Remote",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="tv_remote_app",
+    targets=["f7"],
+    stack_size=4 * 1024,
+    fap_category="Infrared",
+    fap_description="Map captured IR signals to an on-screen TV remote",
+    sources=["tv_remote.c"],
+    fap_libs=["infrared"],
+)
